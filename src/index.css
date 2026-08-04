@@ -1,0 +1,17 @@
+/* DrumTracker.jsx handles its own styling via inline styles plus a
+   <style> block it injects at render time. This file only needs to
+   zero out the browser default margins so its full-bleed layout
+   isn't offset. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: #f1f3f6;
+}
