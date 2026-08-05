@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
-import { Plus, X, Search, Clock, Wrench, MapPin, User, ChevronRight, AlertTriangle, CheckCircle2, PackagePlus, Loader2, Lock, ShieldCheck, KeyRound, UserPlus, Trash2, ArrowLeft, Menu, LayoutGrid, List as ListIcon, LogOut, Pencil, BarChart3, ChevronDown, Check, Download, Cog, ClipboardCopy, MessageSquare, FileText } from "lucide-react";
+import { Plus, X, Search, Clock, Wrench, MapPin, User, ChevronRight, AlertTriangle, CheckCircle2, PackagePlus, Loader2, Lock, ShieldCheck, KeyRound, UserPlus, Trash2, ArrowLeft, Menu, LayoutGrid, List as ListIcon, LogOut, Pencil, BarChart3, ChevronDown, Check, Download, Cog, ClipboardCopy, MessageSquare, FileText, Eye, EyeOff, Printer } from "lucide-react";
 import * as XLSX from "xlsx";
 // jsPDF pulls in html2canvas + dompurify (unused here — we only render
 // tables/text, never HTML), so it's loaded on demand rather than in the
@@ -152,7 +152,10 @@ const SEED_ROSTER = [
   { id: "17107", name: "Giresh" },
 ];
 
-const DEFAULT_ADMIN_PIN = "1234"; // change this from the Admin panel after first login
+// Fixed admin account — not part of the roster, not editable via the Admin
+// panel. This is the one account that can create and manage other employees.
+const ADMIN_ID = "ADMIN";
+const ADMIN_PASSWORD = "admin@123";
 
 // If someone starts editing a drum and closes the app/tab without saving,
 // their lock shouldn't block everyone forever — treat a lock as expired
@@ -171,10 +174,9 @@ export default function DrumTracker() {
   const [history, setHistory] = useState([]);
   const [roster, setRoster] = useState(null); // [{id, name}]
   const [credentials, setCredentials] = useState({}); // { [employeeId]: passwordHash }
-  const [adminPin, setAdminPin] = useState(DEFAULT_ADMIN_PIN);
   const [drumStyles, setDrumStyles] = useState(null); // ["20-58-15", ...]
   const [parLevels, setParLevels] = useState({}); // { [style]: minUsableCount }
-  const [currentEmployee, setCurrentEmployee] = useState({ id: "local", name: "Team" }); // login disabled for now — see AuthGate below to re-enable
+  const [currentEmployee, setCurrentEmployee] = useState(null);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("ALL");
   const [classFilter, setClassFilter] = useState("ALL"); // classification bucket filter for Board/List
@@ -188,6 +190,7 @@ export default function DrumTracker() {
   const [showSummary, setShowSummary] = useState(true);
   const [showAdmin, setShowAdmin] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
   const [view, setView] = useState("board"); // "board" | "list" | "dashboard" | "machines"
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState(null);
@@ -211,7 +214,6 @@ export default function DrumTracker() {
         const h = await window.storage.get("history", true).catch(() => null);
         const r = await window.storage.get("roster", true).catch(() => null);
         const c = await window.storage.get("credentials", true).catch(() => null);
-        const pin = await window.storage.get("adminPin", true).catch(() => null);
         const ds = await window.storage.get("drumStyles", true).catch(() => null);
         const lk = await window.storage.get("locks", true).catch(() => null);
         const pl = await window.storage.get("parLevels", true).catch(() => null);
@@ -219,8 +221,15 @@ export default function DrumTracker() {
         setDrums(d ? JSON.parse(d.value) : SEED_DRUMS);
         setHistory(h ? JSON.parse(h.value) : SEED_HISTORY);
         setRoster(r ? JSON.parse(r.value) : SEED_ROSTER);
-        setCredentials(c ? JSON.parse(c.value) : {});
-        setAdminPin(pin ? pin.value : DEFAULT_ADMIN_PIN);
+        // The admin password lives in the same hashed-credentials store as
+        // everyone else's, so it can be changed the same way — seed it from
+        // the default on first run only, never overwrite an existing hash.
+        const rawCredentials = c ? JSON.parse(c.value) : {};
+        const credentialsNeededSeed = !rawCredentials[ADMIN_ID];
+        const loadedCredentials = credentialsNeededSeed
+          ? { ...rawCredentials, [ADMIN_ID]: await hashPassword(ADMIN_PASSWORD) }
+          : rawCredentials;
+        setCredentials(loadedCredentials);
         setDrumStyles(ds ? JSON.parse(ds.value) : DRUM_STYLES);
         setLocks(lk ? JSON.parse(lk.value) : {});
         setParLevels(pl ? JSON.parse(pl.value) : {});
@@ -228,8 +237,7 @@ export default function DrumTracker() {
         if (!d) await window.storage.set("drums", JSON.stringify(SEED_DRUMS), true);
         if (!h) await window.storage.set("history", JSON.stringify(SEED_HISTORY), true);
         if (!r) await window.storage.set("roster", JSON.stringify(SEED_ROSTER), true);
-        if (!c) await window.storage.set("credentials", JSON.stringify({}), true);
-        if (!pin) await window.storage.set("adminPin", DEFAULT_ADMIN_PIN, true);
+        if (credentialsNeededSeed) await window.storage.set("credentials", JSON.stringify(loadedCredentials), true);
         if (!ds) await window.storage.set("drumStyles", JSON.stringify(DRUM_STYLES), true);
         if (!lk) await window.storage.set("locks", JSON.stringify({}), true);
         if (!pl) await window.storage.set("parLevels", JSON.stringify({}), true);
@@ -321,13 +329,17 @@ export default function DrumTracker() {
     }
   }
 
-  async function persistAdminPin(pin) {
-    setAdminPin(pin);
-    try {
-      await window.storage.set("adminPin", pin, true);
-    } catch (e) {
-      showToast("Couldn't save PIN.", true);
+  // Self-service password change — works the same for the admin account and
+  // every employee, since both live in the same hashed-credentials store.
+  async function changeOwnPassword(currentPw, newPw) {
+    const freshCredentials = await fetchFresh("credentials", credentials);
+    const currentHash = await hashPassword(currentPw);
+    if (currentHash !== freshCredentials[currentEmployee.id]) {
+      return { ok: false, error: "Current password is incorrect." };
     }
+    const newHash = await hashPassword(newPw);
+    await persistCredentials({ ...freshCredentials, [currentEmployee.id]: newHash });
+    return { ok: true };
   }
 
   async function persistDrumStyles(nextStyles) {
@@ -663,7 +675,7 @@ export default function DrumTracker() {
     ]);
 
     const doc = new jsPDF({ orientation: "landscape", unit: "pt" });
-    const amber = [181, 116, 31];
+    const amber = [200, 16, 46];
     const ink = [26, 32, 41];
     const marginX = 40;
 
@@ -796,6 +808,7 @@ export default function DrumTracker() {
       status: record.status,
       condition: record.condition,
       party: record.party,
+      machineNo: record.status === "M/C" ? record.machineNo : undefined,
       notes: "Drum added to register",
       by: userName || "Unnamed",
       ts: Date.now(),
@@ -865,6 +878,7 @@ export default function DrumTracker() {
       status: update.status,
       condition: update.condition,
       party: update.party,
+      machineNo: update.status === "M/C" ? update.machineNo : undefined,
       prNumber: update.status === "URWP" ? update.prNumber : undefined,
       poNumber: update.status === "URWP" ? update.poNumber : undefined,
       scrapReason: update.status === "SCRAP" ? update.scrapReason : undefined,
@@ -945,46 +959,38 @@ export default function DrumTracker() {
     );
   }
 
-  // Login is disabled for now. To re-enable: revert the currentEmployee default above
-  // to useState(null) and un-comment this gate.
-  //
-  // if (!currentEmployee && !showAdmin) {
-  //   return (
-  //     <AuthGate
-  //       roster={roster}
-  //       credentials={credentials}
-  //       adminPin={adminPin}
-  //       onLogin={(emp) => setCurrentEmployee(emp)}
-  //       onSetPassword={async (empId, pw) => {
-  //         const hash = await hashPassword(pw);
-  //         await persistCredentials({ ...credentials, [empId]: hash });
-  //       }}
-  //       onAdminUnlock={() => setShowAdmin(true)}
-  //     />
-  //   );
-  // }
+  if (!currentEmployee) {
+    return (
+      <AuthGate
+        roster={roster}
+        credentials={credentials}
+        onLogin={(emp) => setCurrentEmployee(emp)}
+      />
+    );
+  }
 
   if (showAdmin) {
     return (
       <AdminPanel
         roster={roster}
         credentials={credentials}
-        adminPin={adminPin}
         drumStyles={drumStyles}
         onClose={() => setShowAdmin(false)}
-        onAddEmployee={(emp) => persistRoster([...roster, emp])}
+        onAddEmployee={async (emp) => {
+          const hash = await hashPassword(emp.password);
+          await persistCredentials({ ...credentials, [emp.id]: hash });
+          persistRoster([...roster, { id: emp.id, name: emp.name }]);
+        }}
         onRemoveEmployee={(id) => {
           persistRoster(roster.filter((r) => r.id !== id));
           const nc = { ...credentials };
           delete nc[id];
           persistCredentials(nc);
         }}
-        onResetPassword={(id) => {
-          const nc = { ...credentials };
-          delete nc[id];
-          persistCredentials(nc);
+        onResetPassword={async (id, newPassword) => {
+          const hash = await hashPassword(newPassword);
+          await persistCredentials({ ...credentials, [id]: hash });
         }}
-        onChangePin={(pin) => persistAdminPin(pin)}
         onAddStyle={(style) => persistDrumStyles([...drumStyles, style])}
         onRemoveStyle={(style) => persistDrumStyles(drumStyles.filter((s) => s !== style))}
         parLevels={parLevels}
@@ -1007,8 +1013,8 @@ export default function DrumTracker() {
             <Menu size={20} color="#6B7580" />
           </button>
           <div>
-            <div style={styles.eyebrow}>DRUM REGISTER</div>
-            <h1 style={styles.h1}>Tyre Building Drums</h1>
+            <div style={styles.eyebrow}>MRF TYRES · GOA PLANT</div>
+            <h1 style={styles.h1}>Drum Registry</h1>
           </div>
         </div>
         <div style={styles.headerRight}>
@@ -1016,6 +1022,14 @@ export default function DrumTracker() {
             <User size={14} />
             {userName}
           </div>
+          <button
+            type="button"
+            style={styles.iconBtn}
+            title="Log out"
+            onClick={() => { setCurrentEmployee(null); setShowAdmin(false); setShowMenu(false); }}
+          >
+            <LogOut size={16} color="#6B7580" />
+          </button>
           <button style={styles.primaryBtn} onClick={() => setShowAdd(true)}>
             <Plus size={16} /> Add drum
           </button>
@@ -1025,6 +1039,7 @@ export default function DrumTracker() {
       {showMenu && (
         <SideMenu
           view={view}
+          isAdmin={currentEmployee?.id === ADMIN_ID}
           onSelectBoard={() => { setView("board"); setShowMenu(false); }}
           onSelectList={() => { setView("list"); setShowMenu(false); }}
           onSelectDashboard={() => { setView("dashboard"); setShowMenu(false); }}
@@ -1032,6 +1047,7 @@ export default function DrumTracker() {
           onSelectAdmin={() => { setShowAdmin(true); setShowMenu(false); }}
           onExportCSV={() => { exportDrumsExcel(); setShowMenu(false); }}
           onExportPDF={() => { exportDrumsPDF(); setShowMenu(false); }}
+          onChangePassword={() => { setShowChangePassword(true); setShowMenu(false); }}
           onClose={() => setShowMenu(false)}
         />
       )}
@@ -1261,6 +1277,13 @@ export default function DrumTracker() {
 
       {showAdd && <AddDrumModal onClose={() => setShowAdd(false)} onSave={addDrum} existingIds={drums.map((d) => d.id)} drumStyles={drumStyles} allDrums={drums} />}
 
+      {showChangePassword && (
+        <ChangePasswordModal
+          onClose={() => setShowChangePassword(false)}
+          onSave={changeOwnPassword}
+        />
+      )}
+
       {logTarget && (
         <LogUpdateModal
           drum={logTarget}
@@ -1278,6 +1301,7 @@ export default function DrumTracker() {
         />
       )}
       </div>
+      <Footer />
     </div>
   );
 }
@@ -1286,7 +1310,7 @@ export default function DrumTracker() {
 //        "setpw" -> ID recognized but has no password yet, set one now
 //        "password" -> ID has a password, enter it
 //        "forgot" -> shows instructions + a way into the admin panel to reset
-function SideMenu({ view, onSelectBoard, onSelectList, onSelectDashboard, onSelectMachines, onSelectAdmin, onExportCSV, onExportPDF, onClose }) {
+function SideMenu({ view, isAdmin, onSelectBoard, onSelectList, onSelectDashboard, onSelectMachines, onSelectAdmin, onExportCSV, onExportPDF, onChangePassword, onClose }) {
   return (
     <div style={styles.menuOverlay} onClick={onClose}>
       <div style={styles.menuDrawer} onClick={(e) => e.stopPropagation()}>
@@ -1319,9 +1343,11 @@ function SideMenu({ view, onSelectBoard, onSelectList, onSelectDashboard, onSele
           >
             <Cog size={17} /> Machine view
           </button>
-          <button style={styles.menuItem} onClick={onSelectAdmin}>
-            <ShieldCheck size={17} /> Admin panel
-          </button>
+          {isAdmin && (
+            <button style={styles.menuItem} onClick={onSelectAdmin}>
+              <ShieldCheck size={17} /> Admin panel
+            </button>
+          )}
           <div style={styles.menuDivider} />
           <button style={styles.menuItem} onClick={onExportCSV}>
             <Download size={17} /> Export Excel
@@ -1329,178 +1355,192 @@ function SideMenu({ view, onSelectBoard, onSelectList, onSelectDashboard, onSele
           <button style={styles.menuItem} onClick={onExportPDF}>
             <FileText size={17} /> Export PDF Report
           </button>
+          <div style={styles.menuDivider} />
+          <button style={styles.menuItem} onClick={onChangePassword}>
+            <KeyRound size={17} /> Change Password
+          </button>
         </nav>
       </div>
     </div>
   );
 }
 
-function AuthGate({ roster, credentials, adminPin, onLogin, onSetPassword, onAdminUnlock }) {
-  const [step, setStep] = useState("id");
+// Decorative tire cross-section — pure SVG, no external asset, no trademarked
+// artwork. Concentric rings + tread ticks evoke the product without
+// reproducing any actual MRF logo or mark.
+// Large, faint brand mark for the login backdrop. A radial mask feathers
+// the image's hard rectangular edge into nothing, so it reads as a soft
+// glow bled into the background rather than a sticker pasted on top.
+function LogoWatermark({ size = 640, opacity = 0.16, style }) {
+  return (
+    <img
+      src="/brand/mrf-logo.png"
+      alt=""
+      aria-hidden="true"
+      style={{
+        position: "absolute",
+        width: size,
+        height: size,
+        opacity,
+        pointerEvents: "none",
+        userSelect: "none",
+        WebkitMaskImage: "radial-gradient(circle at center, #000 38%, transparent 68%)",
+        maskImage: "radial-gradient(circle at center, #000 38%, transparent 68%)",
+        ...style,
+      }}
+    />
+  );
+}
+
+function AuthGate({ roster, credentials, onLogin }) {
   const [empId, setEmpId] = useState("");
   const [pw, setPw] = useState("");
-  const [pw2, setPw2] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [adminPinDraft, setAdminPinDraft] = useState("");
+  const [showForgot, setShowForgot] = useState(false);
 
-  const matched = roster.find((r) => r.id.toLowerCase() === empId.trim().toLowerCase());
-
-  function submitId() {
+  async function submit() {
     setError("");
-    if (!empId.trim()) return;
+    setShowForgot(false);
+    if (!empId.trim() || !pw) {
+      setError("Enter your employee ID and password.");
+      return;
+    }
+    const isAdminId = empId.trim().toUpperCase() === ADMIN_ID;
+    const matched = isAdminId
+      ? { id: ADMIN_ID, name: "Administrator" }
+      : roster.find((r) => r.id.toLowerCase() === empId.trim().toLowerCase());
     if (!matched) {
       setError("That employee ID isn't on the roster. Ask your admin to add you.");
       return;
     }
-    if (credentials[matched.id]) {
-      setStep("password");
-    } else {
-      setStep("setpw");
-    }
-  }
-
-  async function submitSetPassword() {
-    setError("");
-    if (pw.length < 4) { setError("Password should be at least 4 characters."); return; }
-    if (pw !== pw2) { setError("Passwords don't match."); return; }
-    setBusy(true);
-    await onSetPassword(matched.id, pw);
-    setBusy(false);
-    onLogin(matched);
-  }
-
-  async function submitPassword() {
-    setError("");
     setBusy(true);
     const hash = await hashPassword(pw);
     setBusy(false);
-    if (hash === credentials[matched.id]) {
+    // Admin's password lives in the same hashed store as everyone else's —
+    // the plaintext default is only a fallback for the rare case where the
+    // seed-on-load step hasn't run yet.
+    const matchesStoredHash = hash === credentials[matched.id];
+    const matchesAdminDefault = isAdminId && !credentials[matched.id] && pw === ADMIN_PASSWORD;
+    if (matchesStoredHash || matchesAdminDefault) {
       onLogin(matched);
     } else {
-      setError("Wrong password.");
-    }
-  }
-
-  function submitAdminPin() {
-    if (adminPinDraft === adminPin) {
-      onAdminUnlock();
-    } else {
-      setError("Wrong admin PIN.");
+      setError("Wrong employee ID or password.");
     }
   }
 
   return (
-    <div style={{ ...styles.app, display: "flex", alignItems: "center", justifyContent: "center" }}>
+    <div style={styles.authScreen}>
       <style>{globalCss}</style>
-      <div style={styles.gateCard}>
-        <div style={styles.eyebrow}>DRUM REGISTER</div>
+      <LogoWatermark
+        size={1100}
+        opacity={0.14}
+        style={{ top: "50%", left: "100%", transform: "translate(-46%, -50%)" }}
+      />
 
-        {step === "id" && (
-          <>
-            <h2 style={{ ...styles.h1, fontSize: 26, marginBottom: 6 }}>Sign in</h2>
-            <p style={{ color: "#6B7280", fontSize: 14, marginBottom: 18, lineHeight: 1.5 }}>
-              Enter your employee ID to continue.
-            </p>
+      <div style={styles.authPanel}>
+        <div style={styles.authBrandRow}>
+          <img src="/brand/mrf-logo.png" alt="MRF Tyres" style={styles.authBadge} />
+          <div>
+            <div style={styles.authEyebrow}>MRF Tyres · Goa Plant</div>
+            <div style={styles.authTitle}>Drum Registry</div>
+          </div>
+        </div>
+
+        <p style={styles.authTagline}>
+          Sign in to track tyre building drums through the shop floor — status, repairs, and life history in one place.
+        </p>
+
+        <div style={styles.authCard}>
+          <div style={styles.field}>
+            <label style={styles.fieldLabel}>Employee ID</label>
             <input
               autoFocus
-              placeholder="Employee ID"
+              placeholder="e.g. 17107"
               value={empId}
               onChange={(e) => setEmpId(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") submitId(); }}
-              style={{ ...styles.input, marginBottom: 12 }}
+              onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+              style={styles.input}
             />
-            {error && <div style={{ ...styles.formError, marginBottom: 10 }}><AlertTriangle size={14} /> {error}</div>}
-            <button type="button" onClick={submitId} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginBottom: 10 }}>
-              Continue
-            </button>
-            <button type="button" onClick={() => { setStep("forgot"); setError(""); }} style={styles.linkBtn}>
-              Admin setup
-            </button>
-          </>
-        )}
-
-        {step === "setpw" && (
-          <>
-            <button type="button" onClick={() => { setStep("id"); setError(""); }} style={styles.backLink}><ArrowLeft size={13} /> Back</button>
-            <h2 style={{ ...styles.h1, fontSize: 24, margin: "8px 0 6px" }}>Set your password</h2>
-            <p style={{ color: "#6B7280", fontSize: 14, marginBottom: 16, lineHeight: 1.5 }}>
-              First time signing in as <strong>{matched.name}</strong>. Choose a password you'll remember.
-            </p>
-            <input type="password" placeholder="New password" value={pw} onChange={(e) => setPw(e.target.value)} style={{ ...styles.input, marginBottom: 10 }} />
-            <input type="password" placeholder="Confirm password" value={pw2} onChange={(e) => setPw2(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") submitSetPassword(); }} style={{ ...styles.input, marginBottom: 12 }} />
-            {error && <div style={{ ...styles.formError, marginBottom: 10 }}><AlertTriangle size={14} /> {error}</div>}
-            <button type="button" disabled={busy} onClick={submitSetPassword} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center" }}>
-              {busy ? "Saving…" : "Save & sign in"}
-            </button>
-          </>
-        )}
-
-        {step === "password" && (
-          <>
-            <button type="button" onClick={() => { setStep("id"); setError(""); setPw(""); }} style={styles.backLink}><ArrowLeft size={13} /> Back</button>
-            <h2 style={{ ...styles.h1, fontSize: 24, margin: "8px 0 6px" }}>Welcome back, {matched.name}</h2>
-            <p style={{ color: "#6B7280", fontSize: 14, marginBottom: 16 }}>Enter your password.</p>
-            <input
-              autoFocus type="password" placeholder="Password" value={pw}
+          </div>
+          <div style={styles.field}>
+            <label style={styles.fieldLabel}>Password</label>
+            <PasswordInput
+              placeholder="Password"
+              value={pw}
               onChange={(e) => setPw(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") submitPassword(); }}
-              style={{ ...styles.input, marginBottom: 10 }}
+              onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
             />
-            {error && <div style={{ ...styles.formError, marginBottom: 10 }}><AlertTriangle size={14} /> {error}</div>}
-            <button type="button" disabled={busy} onClick={submitPassword} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginBottom: 10 }}>
-              {busy ? "Checking…" : "Sign in"}
-            </button>
-            <button type="button" onClick={() => { setStep("forgot"); setError(""); }} style={styles.linkBtn}>
-              Forgot password?
-            </button>
-          </>
-        )}
+          </div>
 
-        {step === "forgot" && (
-          <>
-            <button type="button" onClick={() => { setStep("password"); setError(""); }} style={styles.backLink}><ArrowLeft size={13} /> Back</button>
-            <h2 style={{ ...styles.h1, fontSize: 24, margin: "8px 0 6px" }}>Forgot password</h2>
-            <p style={{ color: "#6B7280", fontSize: 14, marginBottom: 16, lineHeight: 1.5 }}>
-              There's no email tied to accounts here, so passwords are reset by an admin. Ask your supervisor,
-              or enter the admin PIN below to reset it yourself.
+          {error && <div style={{ ...styles.formError, marginBottom: 14 }}><AlertTriangle size={14} /> {error}</div>}
+
+          <button
+            type="button"
+            disabled={busy}
+            onClick={submit}
+            style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginBottom: 10 }}
+          >
+            {busy ? "Checking…" : "Sign In"}
+          </button>
+
+          <button type="button" onClick={() => setShowForgot((v) => !v)} style={styles.linkBtn}>
+            Forgot password?
+          </button>
+          {showForgot && (
+            <p style={styles.authForgotNote}>
+              Ask your admin to sign in and set a new password for you from the Admin panel.
             </p>
-            <input
-              type="password" placeholder="Admin PIN" value={adminPinDraft}
-              onChange={(e) => setAdminPinDraft(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") submitAdminPin(); }}
-              style={{ ...styles.input, marginBottom: 10 }}
-            />
-            {error && <div style={{ ...styles.formError, marginBottom: 10 }}><AlertTriangle size={14} /> {error}</div>}
-            <button type="button" onClick={submitAdminPin} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center" }}>
-              <Lock size={14} /> Open admin panel
-            </button>
-          </>
-        )}
+          )}
+        </div>
       </div>
+
+      <Footer light />
     </div>
   );
 }
 
-function AdminPanel({ roster, credentials, adminPin, drumStyles, onClose, onAddEmployee, onRemoveEmployee, onResetPassword, onChangePin, onAddStyle, onRemoveStyle, parLevels, onSetParLevel }) {
+function AdminPanel({ roster, credentials, drumStyles, onClose, onAddEmployee, onRemoveEmployee, onResetPassword, onAddStyle, onRemoveStyle, parLevels, onSetParLevel }) {
   const [newId, setNewId] = useState("");
   const [newName, setNewName] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [newStyle, setNewStyle] = useState("");
   const [error, setError] = useState("");
   const [styleError, setStyleError] = useState("");
-  const [pinDraft, setPinDraft] = useState(adminPin);
-  const [pinSaved, setPinSaved] = useState(false);
   const [parDrafts, setParDrafts] = useState({});
+  const [resetTargetId, setResetTargetId] = useState(null);
+  const [resetDraft, setResetDraft] = useState("");
+  const [resetError, setResetError] = useState("");
+
+  function submitReset(id) {
+    setResetError("");
+    if (resetDraft.trim().length < 4) {
+      setResetError("Password should be at least 4 characters.");
+      return;
+    }
+    onResetPassword(id, resetDraft.trim());
+    setResetTargetId(null);
+    setResetDraft("");
+  }
 
   function addEmployee() {
     setError("");
-    if (!newId.trim() || !newName.trim()) { setError("Enter both employee ID and name."); return; }
+    if (!newId.trim() || !newName.trim() || !newPassword.trim()) {
+      setError("Enter employee ID, name, and a password.");
+      return;
+    }
+    if (newId.trim().toUpperCase() === ADMIN_ID) {
+      setError(`"${ADMIN_ID}" is reserved for the admin account.`);
+      return;
+    }
     if (roster.some((r) => r.id.toLowerCase() === newId.trim().toLowerCase())) {
       setError("That employee ID already exists."); return;
     }
-    onAddEmployee({ id: newId.trim(), name: newName.trim() });
-    setNewId(""); setNewName("");
+    if (newPassword.trim().length < 4) {
+      setError("Password should be at least 4 characters."); return;
+    }
+    onAddEmployee({ id: newId.trim(), name: newName.trim(), password: newPassword.trim() });
+    setNewId(""); setNewName(""); setNewPassword("");
   }
 
   function addStyle() {
@@ -1511,13 +1551,6 @@ function AdminPanel({ roster, credentials, adminPin, drumStyles, onClose, onAddE
     }
     onAddStyle(newStyle.trim());
     setNewStyle("");
-  }
-
-  function savePin() {
-    if (pinDraft.trim().length < 4) { setError("PIN should be at least 4 digits."); return; }
-    onChangePin(pinDraft.trim());
-    setPinSaved(true);
-    setTimeout(() => setPinSaved(false), 2000);
   }
 
   return (
@@ -1535,6 +1568,7 @@ function AdminPanel({ roster, credentials, adminPin, drumStyles, onClose, onAddE
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
           <Field label="Employee ID"><input style={styles.input} value={newId} onChange={(e) => setNewId(e.target.value)} /></Field>
           <Field label="Name"><input style={styles.input} value={newName} onChange={(e) => setNewName(e.target.value)} /></Field>
+          <Field label="Password"><PasswordInput value={newPassword} onChange={(e) => setNewPassword(e.target.value)} /></Field>
           <button type="button" onClick={addEmployee} style={{ ...styles.primaryBtn, height: 40 }}><Plus size={15} /> Add</button>
         </div>
         {error && <div style={{ ...styles.formError, marginTop: 10 }}><AlertTriangle size={14} /> {error}</div>}
@@ -1544,23 +1578,46 @@ function AdminPanel({ roster, credentials, adminPin, drumStyles, onClose, onAddE
         <div style={styles.historyHead}><User size={14} /> Roster ({roster.length})</div>
         {roster.length === 0 && <div style={styles.emptyCol}>No employees added yet.</div>}
         {roster.map((r) => (
-          <div key={r.id} style={styles.rosterRow}>
-            <div>
-              <div style={{ fontWeight: 700, fontSize: 14 }}>{r.name}</div>
-              <div style={{ fontSize: 12, color: COLORS.sub, fontFamily: "'IBM Plex Mono', monospace" }}>
-                {r.id} · {credentials[r.id] ? "password set" : "no password yet"}
+          <div key={r.id} style={{ borderTop: `1px solid ${COLORS.line}` }}>
+            <div style={{ ...styles.rosterRow, borderTop: "none" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{r.name}</div>
+                <div style={{ fontSize: 12, color: COLORS.sub, fontFamily: "'IBM Plex Mono', monospace" }}>
+                  {r.id} · password set
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  style={styles.smallBtn}
+                  onClick={() => {
+                    setResetTargetId(resetTargetId === r.id ? null : r.id);
+                    setResetDraft("");
+                    setResetError("");
+                  }}
+                >
+                  <KeyRound size={13} /> {resetTargetId === r.id ? "Cancel" : "Set new password"}
+                </button>
+                <button type="button" style={{ ...styles.smallBtn, color: "#B0362E" }} onClick={() => onRemoveEmployee(r.id)}>
+                  <Trash2 size={13} /> Remove
+                </button>
               </div>
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {credentials[r.id] && (
-                <button type="button" style={styles.smallBtn} onClick={() => onResetPassword(r.id)}>
-                  <KeyRound size={13} /> Reset password
+            {resetTargetId === r.id && (
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap", padding: "0 0 12px" }}>
+                <Field label={`New password for ${r.name}`}>
+                  <PasswordInput value={resetDraft} onChange={(e) => setResetDraft(e.target.value)} autoFocus />
+                </Field>
+                <button type="button" onClick={() => submitReset(r.id)} style={{ ...styles.primaryBtn, height: 40 }}>
+                  Save
                 </button>
-              )}
-              <button type="button" style={{ ...styles.smallBtn, color: "#B0362E" }} onClick={() => onRemoveEmployee(r.id)}>
-                <Trash2 size={13} /> Remove
-              </button>
-            </div>
+                {resetError && (
+                  <div style={{ ...styles.formError, width: "100%" }}>
+                    <AlertTriangle size={14} /> {resetError}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -1615,18 +1672,7 @@ function AdminPanel({ roster, credentials, adminPin, drumStyles, onClose, onAddE
           );
         })}
       </div>
-
-      <div style={{ ...styles.adminCard, marginTop: 14 }}>
-        <div style={styles.historyHead}><Lock size={14} /> Admin PIN</div>
-        <p style={{ fontSize: 13, color: COLORS.sub, marginBottom: 10 }}>
-          This PIN unlocks this panel and lets anyone reset a forgotten password. Share it only with supervisors.
-        </p>
-        <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
-          <Field label="New admin PIN"><input style={styles.input} value={pinDraft} onChange={(e) => setPinDraft(e.target.value)} /></Field>
-          <button type="button" onClick={savePin} style={{ ...styles.primaryBtn, height: 40 }}>Save PIN</button>
-          {pinSaved && <span style={{ fontSize: 12.5, color: "#2F5233" }}>Saved</span>}
-        </div>
-      </div>
+      <Footer />
     </div>
   );
 }
@@ -1869,6 +1915,93 @@ function DrumTag({ drum, onClick, lockedBy, daysInStatus }) {
   );
 }
 
+// Formal per-drum traceability record — identification, life summary, full
+// chronological history, and signature lines for physical sign-off. Doubles
+// as the soft copy (the PDF itself) and the hard copy (printed from it) for
+// audit purposes (e.g. IATF 16949 tooling traceability).
+async function exportDrumHistoryCard(drum, historyForDrum) {
+  const [{ default: jsPDF }, { default: autoTable }] = await Promise.all([
+    import("jspdf"),
+    import("jspdf-autotable"),
+  ]);
+
+  const doc = new jsPDF({ orientation: "portrait", unit: "pt" });
+  const red = [200, 16, 46];
+  const ink = [26, 32, 41];
+  const marginX = 40;
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(15);
+  doc.setTextColor(...ink);
+  doc.text("MRF Tyres — Goa Plant", marginX, 40);
+  doc.setFontSize(11);
+  doc.setFont("helvetica", "normal");
+  doc.text("Tyre Building Drum — History Card", marginX, 58);
+  doc.setFontSize(9);
+  doc.setTextColor(107, 117, 128);
+  doc.text(`Generated ${fmtDate(today())}`, marginX, 72);
+
+  const cond = CONDITIONS[drum.condition]?.label || drum.condition || "—";
+
+  autoTable(doc, {
+    startY: 86,
+    margin: { left: marginX, right: marginX },
+    theme: "grid",
+    styles: { fontSize: 9.5, cellPadding: 6 },
+    headStyles: { fillColor: red, textColor: 255 },
+    head: [["Field", "Value", "Field", "Value"]],
+    body: [
+      ["Drum ID", drum.id, "Style / Spec", drum.size],
+      ["Status", STATUS_MAP[drum.status] || drum.status, "Condition", cond],
+      ["Registered On", drum.createdAt ? fmtDate(drum.createdAt) : "—", "Total Life in Service", `${drum.totalLifeDays || 0} day(s)`],
+      ["Times Repaired", String(drum.repairCount || 0), "Machine No.", drum.machineNo || "—"],
+      ["With Party", drum.party || "—", "PR / PO No.", [drum.prNumber, drum.poNumber].filter(Boolean).join(" / ") || "—"],
+      ["Scrap Reason", drum.scrapReason || "—", "", ""],
+    ],
+    columnStyles: {
+      0: { fontStyle: "bold", textColor: ink, cellWidth: 105 },
+      2: { fontStyle: "bold", textColor: ink, cellWidth: 105 },
+    },
+  });
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(11);
+  doc.setTextColor(...ink);
+  doc.text("Life History", marginX, doc.lastAutoTable.finalY + 24);
+
+  const sorted = [...historyForDrum].sort((a, b) => a.ts - b.ts);
+
+  autoTable(doc, {
+    startY: doc.lastAutoTable.finalY + 34,
+    margin: { left: marginX, right: marginX },
+    theme: "striped",
+    styles: { fontSize: 8.5, cellPadding: 5 },
+    headStyles: { fillColor: ink },
+    head: [["Date", "Status", "Condition", "Life This Cycle (days)", "Party / Machine", "PR / PO", "Notes"]],
+    body: sorted.map((h) => [
+      fmtDate(h.date),
+      STATUS_MAP[h.status] || h.status,
+      CONDITIONS[h.condition]?.label || h.condition,
+      h.cycleDays !== null && h.cycleDays !== undefined ? String(h.cycleDays) : "—",
+      h.party || h.machineNo || "—",
+      [h.prNumber, h.poNumber].filter(Boolean).join(" / ") || "—",
+      h.notes || h.scrapReason || "—",
+    ]),
+    didDrawPage: () => {
+      const pageCount = doc.internal.getNumberOfPages();
+      doc.setFontSize(8);
+      doc.setTextColor(150, 150, 150);
+      doc.text(
+        `Page ${doc.internal.getCurrentPageInfo().pageNumber} of ${pageCount}`,
+        doc.internal.pageSize.getWidth() - marginX - 60,
+        doc.internal.pageSize.getHeight() - 16
+      );
+    },
+  });
+
+  doc.save(`drum-history-card-${drum.id}.pdf`);
+}
+
 function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDeleteEntry, activeLock, currentUser, notes, onAddNote, onDeleteNote }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [confirmingEntryTs, setConfirmingEntryTs] = useState(null);
@@ -1923,6 +2056,14 @@ function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDe
             disabled={lockedByOther}
           >
             <Wrench size={15} /> Log status update
+          </button>
+
+          <button
+            type="button"
+            style={{ ...styles.smallBtn, width: "100%", justifyContent: "center", marginTop: 8, padding: "9px 0" }}
+            onClick={() => exportDrumHistoryCard(drum, history)}
+          >
+            <Printer size={14} /> Print History Card
           </button>
 
           <div style={{ ...styles.historyHead, marginTop: 20 }}>
@@ -1990,6 +2131,7 @@ function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDe
                   </div>
                   <div style={styles.timelineMeta}>
                     {CONDITIONS[h.condition]?.label || h.condition}
+                    {h.machineNo ? ` · Machine #${h.machineNo}` : ""}
                     {h.party ? ` · ${h.party}` : ""}
                     {h.prNumber ? ` · PR ${h.prNumber}` : ""}
                     {h.poNumber ? ` · PO ${h.poNumber}` : ""}
@@ -2069,6 +2211,106 @@ function DetailStat({ label, value }) {
     <div>
       <div style={styles.statLabel}>{label}</div>
       <div style={styles.statValue}>{value}</div>
+    </div>
+  );
+}
+
+function ChangePasswordModal({ onClose, onSave }) {
+  const [currentPw, setCurrentPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [newPw2, setNewPw2] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  async function submit() {
+    setError("");
+    if (!currentPw) {
+      setError("Enter your current password.");
+      return;
+    }
+    if (newPw.length < 4) {
+      setError("New password should be at least 4 characters.");
+      return;
+    }
+    if (newPw !== newPw2) {
+      setError("New passwords don't match.");
+      return;
+    }
+    setBusy(true);
+    const result = await onSave(currentPw, newPw);
+    setBusy(false);
+    if (result.ok) {
+      setDone(true);
+    } else {
+      setError(result.error || "Couldn't change password.");
+    }
+  }
+
+  return (
+    <div className="dt-overlay" style={styles.overlay} onClick={onClose}>
+      <div className="dt-sheet" style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <div className="dt-handle" style={styles.sheetHandle} />
+        <div style={styles.panelHead}>
+          <div style={styles.eyebrow}>ACCOUNT</div>
+          <button type="button" style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
+        </div>
+        <h2 style={{ ...styles.panelTitle, marginBottom: 16 }}>
+          <KeyRound size={18} style={{ marginRight: 8, verticalAlign: -3 }} />
+          Change Password
+        </h2>
+        {done ? (
+          <>
+            <div style={{ ...styles.formError, color: "#2F5233", background: "#DCEEDD" }}>
+              <CheckCircle2 size={14} /> Password updated.
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginTop: 12 }}
+            >
+              Done
+            </button>
+          </>
+        ) : (
+          <div style={styles.form}>
+            <Field label="Current Password">
+              <PasswordInput
+                placeholder="Current password"
+                value={currentPw}
+                onChange={(e) => setCurrentPw(e.target.value)}
+                autoFocus
+              />
+            </Field>
+            <Field label="New Password">
+              <PasswordInput placeholder="New password" value={newPw} onChange={(e) => setNewPw(e.target.value)} />
+            </Field>
+            <Field label="Confirm New Password">
+              <PasswordInput
+                placeholder="Confirm new password"
+                value={newPw2}
+                onChange={(e) => setNewPw2(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") submit();
+                }}
+              />
+            </Field>
+            {error && (
+              <div style={styles.formError}>
+                <AlertTriangle size={14} /> {error}
+              </div>
+            )}
+            <button
+              type="button"
+              disabled={busy}
+              onClick={submit}
+              style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginTop: 4 }}
+            >
+              {busy ? "Saving…" : "Save New Password"}
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2418,12 +2660,62 @@ function EditHistoryModal({ entry, onClose, onSave }) {
   );
 }
 
+// Shared credit line, shown on every screen. `light` switches to a
+// white-on-dark treatment for screens with a dark/colored background (the
+// login page) instead of the default dark-on-light used everywhere else.
+function Footer({ light }) {
+  return (
+    <footer style={light ? styles.footerLight : styles.footer}>
+      © {new Date().getFullYear()} · Designed and developed by Don Cherian
+    </footer>
+  );
+}
+
 function Field({ label, children }) {
   return (
     <label style={styles.field}>
       <span style={styles.fieldLabel}>{label}</span>
       {children}
     </label>
+  );
+}
+
+function PasswordInput({ value, onChange, placeholder, onKeyDown, autoFocus, style }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div style={{ position: "relative" }}>
+      <input
+        type={visible ? "text" : "password"}
+        placeholder={placeholder}
+        value={value}
+        onChange={onChange}
+        onKeyDown={onKeyDown}
+        autoFocus={autoFocus}
+        style={{ ...styles.input, paddingRight: 40, width: "100%", ...style }}
+      />
+      <button
+        type="button"
+        tabIndex={-1}
+        onClick={() => setVisible((v) => !v)}
+        title={visible ? "Hide password" : "Show password"}
+        style={{
+          position: "absolute",
+          right: 4,
+          top: "50%",
+          transform: "translateY(-50%)",
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          color: COLORS.sub,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 6,
+        }}
+      >
+        {visible ? <EyeOff size={16} /> : <Eye size={16} />}
+      </button>
+    </div>
   );
 }
 
@@ -2480,17 +2772,20 @@ function CustomSelect({ value, onChange, options, disabled }) {
 
 // ---------- style tokens ----------
 // Palette: light, professional workspace — near-solid white/grey surfaces,
-// crisp 1px borders, restrained shadows. Copper stays the single accent
-// color for anything actionable. Deliberately low on transparency/blur so
-// it reads as a serious operations tool, not a marketing page.
+// crisp 1px borders, restrained shadows. MRF's brand red is the single
+// accent color for anything actionable (the `amber`/`amberDark` names are
+// legacy from an earlier copper palette — kept as-is to avoid touching
+// every call site, but both now hold red values). Deliberately low on
+// transparency/blur so it reads as a serious operations tool, not a
+// marketing page.
 const COLORS = {
   ground: "#F1F3F6",
   panel: "#FFFFFF",
   ink: "#1A2029",
   sub: "#5B6472",
   line: "#E1E4E9",
-  amber: "#B5741F",
-  amberDark: "#8F5A18",
+  amber: "#C8102E",
+  amberDark: "#8E0B20",
 };
 
 // Kept as small, named tokens (not "glass") so surfaces stay easy to scan:
@@ -2515,14 +2810,14 @@ const SURFACE_MUTED = {
 
 const SHADOW_ELEV = "0 20px 50px rgba(16,24,40,0.12)";
 const SHADOW_POP = "0 4px 14px rgba(16,24,40,0.07)";
-const SHADOW_BTN = "0 2px 6px rgba(181,116,31,0.28)";
+const SHADOW_BTN = "0 2px 6px rgba(200,16,46,0.28)";
 
 const globalCss = `
   * { box-sizing: border-box; }
   html { background: ${COLORS.ground}; }
   body, input, select, textarea, button { font-family: 'DM Sans', ui-sans-serif, system-ui, sans-serif; }
   ::placeholder { color: #98A1AD; }
-  ::selection { background: rgba(181,116,31,0.22); color: #1A2029; }
+  ::selection { background: rgba(200,16,46,0.22); color: #1A2029; }
   input:focus, select:focus, textarea:focus, button:focus-visible {
     outline: 2px solid ${COLORS.amber}; outline-offset: 1px;
   }
@@ -2661,7 +2956,7 @@ const styles = {
     flex: "0 0 220px",
     display: "flex",
     flexDirection: "column",
-    maxHeight: "calc(100vh - 220px)",
+    height: "calc(100vh - 170px)",
   },
   columnHead: {
     padding: "12px 12px 10px",
@@ -2691,7 +2986,7 @@ const styles = {
   columnBreakdownChip: {
     fontSize: 9.5, fontWeight: 700, borderRadius: 5, padding: "2px 6px",
   },
-  columnBody: { padding: 8, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" },
+  columnBody: { flex: 1, minHeight: 0, padding: 8, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" },
   emptyCol: { fontSize: 12, color: "#9AA2AA", textAlign: "center", padding: "14px 4px", fontStyle: "italic" },
   tag: {
     position: "relative",
@@ -2828,16 +3123,80 @@ const styles = {
     background: "none", border: "none", borderRadius: 7, padding: "10px 10px", fontSize: 14.5,
     color: COLORS.ink, cursor: "pointer", textAlign: "left", fontFamily: "inherit", fontWeight: 700,
   },
-  customSelectOptionActive: { background: "#F5EEE1", color: COLORS.amberDark, fontWeight: 700 },
+  customSelectOptionActive: { background: "#FBE8EA", color: COLORS.amberDark, fontWeight: 700 },
   formError: { display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#B0362E", background: "#F6D9D6", borderRadius: 8, padding: "8px 10px" },
   lifeBox: {
     ...SURFACE_MUTED, borderRadius: 10, padding: "12px 14px",
     display: "flex", flexDirection: "column", gap: 6, marginTop: 2,
   },
   lifeBoxRow: { display: "flex", justifyContent: "space-between", fontSize: 13, color: COLORS.ink },
-  gateCard: {
-    ...SURFACE_RAISED, borderRadius: 14, padding: 28, width: "100%", maxWidth: 380,
-    boxShadow: SHADOW_ELEV, color: COLORS.ink,
+  authScreen: {
+    position: "relative",
+    minHeight: "100vh",
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+    background: "linear-gradient(135deg, #ED1B2F 0%, #C8102E 32%, #6B0E1C 68%, #1C0609 100%)",
+  },
+  authPanel: {
+    position: "relative",
+    zIndex: 1,
+    width: "100%",
+    maxWidth: 400,
+    display: "flex",
+    flexDirection: "column",
+    gap: 28,
+  },
+  authBrandRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 14,
+  },
+  authBadge: {
+    width: 52,
+    height: 52,
+    flexShrink: 0,
+    borderRadius: "50%",
+    objectFit: "cover",
+    boxShadow: "0 10px 26px rgba(0,0,0,0.35), 0 0 0 3px rgba(255,255,255,0.15)",
+  },
+  authEyebrow: {
+    fontFamily: "'IBM Plex Mono', ui-monospace, monospace",
+    fontSize: 11,
+    letterSpacing: "0.14em",
+    textTransform: "uppercase",
+    color: "rgba(255,255,255,0.8)",
+  },
+  authTitle: {
+    fontFamily: "'Space Grotesk', sans-serif",
+    fontSize: 24,
+    fontWeight: 700,
+    color: "#fff",
+    marginTop: 3,
+    textShadow: "0 2px 12px rgba(0,0,0,0.25)",
+  },
+  authTagline: {
+    fontSize: 13.5,
+    lineHeight: 1.6,
+    color: "rgba(255,255,255,0.85)",
+    maxWidth: 360,
+    marginTop: -12,
+  },
+  authCard: {
+    background: "#fff",
+    borderRadius: 16,
+    padding: "30px 28px 28px",
+    boxShadow: "0 40px 80px rgba(0,0,0,0.4)",
+    borderTop: "4px solid #C8102E",
+  },
+  authForgotNote: {
+    fontSize: 12.5,
+    color: COLORS.sub,
+    lineHeight: 1.5,
+    marginTop: 8,
+    textAlign: "center",
   },
   savingIndicator: {
     position: "fixed", bottom: 16, left: 16, fontSize: 12, color: COLORS.sub,
@@ -2904,7 +3263,7 @@ const styles = {
     ...SURFACE, borderRadius: 20, padding: "6px 12px",
     cursor: "pointer", fontFamily: "inherit",
   },
-  sortChipActive: { background: "#F5EEE1", borderColor: COLORS.amber, color: COLORS.amberDark },
+  sortChipActive: { background: "#FBE8EA", borderColor: COLORS.amber, color: COLORS.amberDark },
   listCard: {
     display: "flex", flexDirection: "column", gap: 4, width: "100%", textAlign: "left",
     ...SURFACE, borderRadius: 10,
@@ -2923,7 +3282,7 @@ const styles = {
     ...SURFACE, borderRadius: 12, padding: "14px 16px", color: COLORS.ink, boxShadow: SHADOW_POP,
   },
   dashCardEmphasized: {
-    background: "#FBF6EE", borderColor: "#E9D3AC",
+    background: "#FDECED", borderColor: "#F3C2C7",
   },
   dashCardHead: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 12 },
   dashCardTitle: { fontSize: 16, fontWeight: 700, fontFamily: "'IBM Plex Mono', ui-monospace, monospace", color: COLORS.ink },
@@ -2953,7 +3312,7 @@ const styles = {
     background: "#F6D9D6", border: "1px solid #E3B3AE", borderRadius: 8, padding: "8px 10px", marginBottom: 12,
   },
   longestBadge: {
-    fontSize: 9, fontWeight: 700, color: COLORS.amberDark, background: "#F5EEE1",
+    fontSize: 9, fontWeight: 700, color: COLORS.amberDark, background: "#FBE8EA",
     borderRadius: 4, padding: "1px 5px", marginLeft: 6, verticalAlign: "middle",
   },
   dashMiniStatsRow: { display: "flex", gap: 14, marginBottom: 12, flexWrap: "wrap" },
@@ -3007,6 +3366,30 @@ const styles = {
     background: "none", border: "none", borderRadius: 8, padding: "11px 10px",
     fontSize: 14.5, fontWeight: 600, color: COLORS.ink, cursor: "pointer", fontFamily: "inherit",
   },
-  menuItemActive: { background: "#F5EEE1", color: COLORS.amberDark },
+  menuItemActive: { background: "#FBE8EA", color: COLORS.amberDark },
   menuDivider: { height: 1, background: COLORS.line, margin: "14px 0" },
+  footer: {
+    textAlign: "center",
+    padding: "18px 12px 6px",
+    fontSize: 11.5,
+    fontWeight: 700,
+    color: COLORS.ink,
+    fontFamily: "'IBM Plex Mono', ui-monospace, monospace",
+    letterSpacing: "0.02em",
+  },
+  footerLight: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    zIndex: 1,
+    textAlign: "center",
+    padding: "18px 12px 6px",
+    fontSize: 11.5,
+    fontWeight: 700,
+    color: "rgba(255,255,255,0.75)",
+    fontFamily: "'IBM Plex Mono', ui-monospace, monospace",
+    letterSpacing: "0.02em",
+    textShadow: "0 1px 6px rgba(0,0,0,0.3)",
+  },
 };
