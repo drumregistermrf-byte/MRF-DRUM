@@ -53,3 +53,26 @@ if (typeof window !== "undefined" && !window.storage) {
     },
   };
 }
+
+// Drum edit locks are handled by dedicated endpoints (not window.storage)
+// because acquiring one needs to be a single atomic operation on the server —
+// a client-side read-then-write on a shared blob can't stop two people who
+// click "edit" at the same instant from both believing they got the lock.
+export async function fetchLocks() {
+  const data = await apiFetch("/api/locks");
+  return data.locks || {};
+}
+
+export async function acquireLock(drumId, by) {
+  return apiFetch(`/api/locks/${encodeURIComponent(drumId)}/acquire`, {
+    method: "POST",
+    body: JSON.stringify({ by }),
+  });
+}
+
+export async function releaseLock(drumId, by) {
+  return apiFetch(`/api/locks/${encodeURIComponent(drumId)}/release`, {
+    method: "POST",
+    body: JSON.stringify({ by }),
+  });
+}

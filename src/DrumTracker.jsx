@@ -1,6 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { Plus, X, Search, Clock, Wrench, MapPin, User, ChevronRight, AlertTriangle, CheckCircle2, PackagePlus, Loader2, Lock, ShieldCheck, KeyRound, UserPlus, Trash2, ArrowLeft, Menu, LayoutGrid, List as ListIcon, LogOut, Pencil, BarChart3, ChevronDown, Check, Download, Cog, ClipboardCopy, MessageSquare, FileText, Eye, EyeOff, Printer } from "lucide-react";
 import * as XLSX from "xlsx";
+import {
+  fetchLocks as apiFetchLocks,
+  acquireLock as apiAcquireLock,
+  releaseLock as apiReleaseLock,
+} from "./lib/apiStorage";
 // jsPDF pulls in html2canvas + dompurify (unused here — we only render
 // tables/text, never HTML), so it's loaded on demand rather than in the
 // main bundle.
@@ -215,7 +220,7 @@ export default function DrumTracker() {
         const r = await window.storage.get("roster", true).catch(() => null);
         const c = await window.storage.get("credentials", true).catch(() => null);
         const ds = await window.storage.get("drumStyles", true).catch(() => null);
-        const lk = await window.storage.get("locks", true).catch(() => null);
+        const lockMap = await apiFetchLocks().catch(() => ({}));
         const pl = await window.storage.get("parLevels", true).catch(() => null);
         const nt = await window.storage.get("notes", true).catch(() => null);
         setDrums(d ? JSON.parse(d.value) : SEED_DRUMS);
@@ -231,7 +236,7 @@ export default function DrumTracker() {
           : rawCredentials;
         setCredentials(loadedCredentials);
         setDrumStyles(ds ? JSON.parse(ds.value) : DRUM_STYLES);
-        setLocks(lk ? JSON.parse(lk.value) : {});
+        setLocks(lockMap);
         setParLevels(pl ? JSON.parse(pl.value) : {});
         setNotes(nt ? JSON.parse(nt.value) : []);
         if (!d) await window.storage.set("drums", JSON.stringify(SEED_DRUMS), true);
@@ -239,7 +244,6 @@ export default function DrumTracker() {
         if (!r) await window.storage.set("roster", JSON.stringify(SEED_ROSTER), true);
         if (credentialsNeededSeed) await window.storage.set("credentials", JSON.stringify(loadedCredentials), true);
         if (!ds) await window.storage.set("drumStyles", JSON.stringify(DRUM_STYLES), true);
-        if (!lk) await window.storage.set("locks", JSON.stringify({}), true);
         if (!pl) await window.storage.set("parLevels", JSON.stringify({}), true);
         if (!nt) await window.storage.set("notes", JSON.stringify([]), true);
       } catch (e) {
@@ -269,7 +273,7 @@ export default function DrumTracker() {
         fetchFresh("history", null),
         fetchFresh("roster", null),
         fetchFresh("drumStyles", null),
-        fetchFresh("locks", null),
+        apiFetchLocks().catch(() => null),
         fetchFresh("parLevels", null),
         fetchFresh("notes", null),
       ]);
@@ -389,31 +393,34 @@ export default function DrumTracker() {
 
   // Tries to claim the editing lock for a drum. Returns the holder's name if
   // someone else already has an active lock on it, or null if the lock was
-  // successfully claimed (or refreshed, if it's already ours).
+  // successfully claimed (or refreshed, if it's already ours). The acquire
+  // itself is one atomic operation on the server (see server/index.js), so
+  // two people clicking "edit" at the same instant can't both win it.
   async function acquireLock(drumId) {
-    const freshLocks = await fetchFresh("locks", locks);
-    const existing = freshLocks[drumId];
-    if (isLockActive(existing) && existing.by !== userName) {
-      return existing.by;
-    }
-    const nextLocks = { ...freshLocks, [drumId]: { by: userName, ts: Date.now() } };
-    setLocks(nextLocks);
     try {
-      await window.storage.set("locks", JSON.stringify(nextLocks), true);
+      const result = await apiAcquireLock(drumId, userName);
+      if (result.lock) {
+        setLocks((prev) => ({ ...prev, [drumId]: result.lock }));
+      }
+      if (!result.ok) {
+        return result.lock?.by ?? null;
+      }
+      return null;
     } catch (e) {
-      // non-fatal — worst case the lock indicator lags briefly
+      // Couldn't reach the server — fail open rather than blocking the user
+      // from editing; worst case the lock indicator lags briefly.
+      return null;
     }
-    return null;
   }
 
   async function releaseLock(drumId) {
-    const freshLocks = await fetchFresh("locks", locks);
-    if (!freshLocks[drumId]) return;
-    const nextLocks = { ...freshLocks };
-    delete nextLocks[drumId];
-    setLocks(nextLocks);
+    setLocks((prev) => {
+      const next = { ...prev };
+      delete next[drumId];
+      return next;
+    });
     try {
-      await window.storage.set("locks", JSON.stringify(nextLocks), true);
+      await apiReleaseLock(drumId, userName);
     } catch (e) {
       // non-fatal
     }

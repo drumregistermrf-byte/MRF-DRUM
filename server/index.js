@@ -15,10 +15,13 @@ if (!MONGODB_URI) {
   throw new Error("MONGODB_URI env var is required");
 }
 
+const LOCK_TIMEOUT_MS = 2 * 60 * 1000;
+
 const client = new MongoClient(MONGODB_URI);
 await client.connect();
 const db = client.db("mrf_drum_registry");
 const storage = db.collection("storage");
+const locks = db.collection("locks");
 
 const app = express();
 app.use(express.json());
@@ -56,6 +59,49 @@ app.put("/api/storage/:key", async (req, res) => {
     { $set: { value, updatedAt: new Date() } },
     { upsert: true }
   );
+  res.json({ ok: true });
+});
+
+// Drum edit locks live in their own collection (not the generic storage blob)
+// so acquiring one can be a single atomic Mongo operation instead of a
+// read-modify-write on a shared JSON document, which would let two people
+// clicking "edit" at the same moment both believe they got the lock.
+app.get("/api/locks", async (req, res) => {
+  const all = await locks.find({}).toArray();
+  const out = {};
+  for (const l of all) out[l._id] = { by: l.by, ts: l.ts };
+  res.json({ locks: out });
+});
+
+app.post("/api/locks/:drumId/acquire", async (req, res) => {
+  const { by } = req.body;
+  if (!by) return res.status(400).json({ error: "by is required" });
+  const drumId = req.params.drumId;
+  const now = Date.now();
+  const cutoff = now - LOCK_TIMEOUT_MS;
+
+  try {
+    const doc = await locks.findOneAndUpdate(
+      { _id: drumId, $or: [{ ts: { $lt: cutoff } }, { by }] },
+      { $set: { by, ts: now } },
+      { upsert: true, returnDocument: "after" }
+    );
+    res.json({ ok: true, lock: { by: doc.by, ts: doc.ts } });
+  } catch (err) {
+    if (err.code === 11000) {
+      const existing = await locks.findOne({ _id: drumId });
+      return res.json({
+        ok: false,
+        lock: existing ? { by: existing.by, ts: existing.ts } : null,
+      });
+    }
+    throw err;
+  }
+});
+
+app.post("/api/locks/:drumId/release", async (req, res) => {
+  const { by } = req.body;
+  await locks.deleteOne({ _id: req.params.drumId, by });
   res.json({ ok: true });
 });
 
