@@ -61,9 +61,8 @@ const USABLE_BUCKETS = ["NEW_STORES", "REPAIRED_RACK", "OKAY_RACK"];
 // Drum styles, as used on the shop floor. Add more any time from the Admin panel.
 const DRUM_STYLES = ["16-13", "19-13", "20-58-15", "20-75-15", "22-58-15", "24-15", "25-65-23", "28-15", "28-25"];
 
-function uid(prefix = "D") {
-  return `${prefix}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
-}
+// Drum bore sizes (mm). Add more any time from the Admin panel.
+const DRUM_BORES = ["90mm", "110mm"];
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -180,6 +179,7 @@ export default function DrumTracker() {
   const [roster, setRoster] = useState(null); // [{id, name}]
   const [credentials, setCredentials] = useState({}); // { [employeeId]: passwordHash }
   const [drumStyles, setDrumStyles] = useState(null); // ["20-58-15", ...]
+  const [drumBores, setDrumBores] = useState(null); // ["90mm", "110mm", ...]
   const [parLevels, setParLevels] = useState({}); // { [style]: minUsableCount }
   const [currentEmployee, setCurrentEmployee] = useState(null);
   const [query, setQuery] = useState("");
@@ -190,6 +190,7 @@ export default function DrumTracker() {
   const [showAdd, setShowAdd] = useState(false);
   const [showLog, setShowLog] = useState(null); // drum id to log an update for
   const [editingEntry, setEditingEntry] = useState(null); // history event being edited
+  const [editingDrumId, setEditingDrumId] = useState(null); // drum id whose ID/style/bore is being corrected
   const [locks, setLocks] = useState({}); // { [drumId]: { by, ts } } — who's currently editing what
   const [notes, setNotes] = useState([]); // [{ id, drumId, text, by, ts }] — free-form comments, separate from status history
   const [showSummary, setShowSummary] = useState(true);
@@ -220,6 +221,7 @@ export default function DrumTracker() {
         const r = await window.storage.get("roster", true).catch(() => null);
         const c = await window.storage.get("credentials", true).catch(() => null);
         const ds = await window.storage.get("drumStyles", true).catch(() => null);
+        const db = await window.storage.get("drumBores", true).catch(() => null);
         const lockMap = await apiFetchLocks().catch(() => ({}));
         const pl = await window.storage.get("parLevels", true).catch(() => null);
         const nt = await window.storage.get("notes", true).catch(() => null);
@@ -236,6 +238,7 @@ export default function DrumTracker() {
           : rawCredentials;
         setCredentials(loadedCredentials);
         setDrumStyles(ds ? JSON.parse(ds.value) : DRUM_STYLES);
+        setDrumBores(db ? JSON.parse(db.value) : DRUM_BORES);
         setLocks(lockMap);
         setParLevels(pl ? JSON.parse(pl.value) : {});
         setNotes(nt ? JSON.parse(nt.value) : []);
@@ -244,6 +247,7 @@ export default function DrumTracker() {
         if (!r) await window.storage.set("roster", JSON.stringify(SEED_ROSTER), true);
         if (credentialsNeededSeed) await window.storage.set("credentials", JSON.stringify(loadedCredentials), true);
         if (!ds) await window.storage.set("drumStyles", JSON.stringify(DRUM_STYLES), true);
+        if (!db) await window.storage.set("drumBores", JSON.stringify(DRUM_BORES), true);
         if (!pl) await window.storage.set("parLevels", JSON.stringify({}), true);
         if (!nt) await window.storage.set("notes", JSON.stringify([]), true);
       } catch (e) {
@@ -252,6 +256,7 @@ export default function DrumTracker() {
         setRoster(SEED_ROSTER);
         setCredentials({});
         setDrumStyles(DRUM_STYLES);
+        setDrumBores(DRUM_BORES);
         setLocks({});
         setParLevels({});
         setNotes([]);
@@ -268,11 +273,12 @@ export default function DrumTracker() {
   useEffect(() => {
     const interval = setInterval(async () => {
       if (drums === null) return; // don't poll until initial load finished
-      const [freshDrums, freshHistory, freshRoster, freshStyles, freshLocks, freshPar, freshNotes] = await Promise.all([
+      const [freshDrums, freshHistory, freshRoster, freshStyles, freshBores, freshLocks, freshPar, freshNotes] = await Promise.all([
         fetchFresh("drums", null),
         fetchFresh("history", null),
         fetchFresh("roster", null),
         fetchFresh("drumStyles", null),
+        fetchFresh("drumBores", null),
         apiFetchLocks().catch(() => null),
         fetchFresh("parLevels", null),
         fetchFresh("notes", null),
@@ -281,6 +287,7 @@ export default function DrumTracker() {
       if (freshHistory) setHistory(freshHistory);
       if (freshRoster) setRoster(freshRoster);
       if (freshStyles) setDrumStyles(freshStyles);
+      if (freshBores) setDrumBores(freshBores);
       if (freshLocks) setLocks(freshLocks);
       if (freshPar) setParLevels(freshPar);
       if (freshNotes) setNotes(freshNotes);
@@ -289,7 +296,7 @@ export default function DrumTracker() {
   }, [drums === null]);
 
   // ---------- keep the editing lock alive while a modal is open ----------
-  const activeLockDrumId = showLog || (editingEntry ? editingEntry.drumId : null);
+  const activeLockDrumId = showLog || editingDrumId || (editingEntry ? editingEntry.drumId : null);
   useEffect(() => {
     if (!activeLockDrumId) return;
     const heartbeat = setInterval(() => {
@@ -352,6 +359,15 @@ export default function DrumTracker() {
       await window.storage.set("drumStyles", JSON.stringify(nextStyles), true);
     } catch (e) {
       showToast("Couldn't save drum styles.", true);
+    }
+  }
+
+  async function persistDrumBores(nextBores) {
+    setDrumBores(nextBores);
+    try {
+      await window.storage.set("drumBores", JSON.stringify(nextBores), true);
+    } catch (e) {
+      showToast("Couldn't save drum bores.", true);
     }
   }
 
@@ -647,17 +663,17 @@ export default function DrumTracker() {
     if (!drums) return;
 
     const registerHeaders = [
-      "Drum ID", "Style", "Status Code", "Status", "Condition", "Machine No",
+      "Drum ID Number", "Style", "Bore (mm)", "Status Code", "Status", "Condition", "Machine No",
       "With Party", "Days In Status", "Total Life Days", "Times Repaired", "Added On",
     ];
     const registerRows = drums.map((d) => [
-      d.id, d.size, d.status, STATUS_MAP[d.status] || "", CONDITIONS[d.condition]?.label || d.condition,
+      d.id, d.size, d.bore || "", d.status, STATUS_MAP[d.status] || "", CONDITIONS[d.condition]?.label || d.condition,
       d.machineNo || "", d.party || "", daysInStatusMap[d.id] ?? "", d.totalLifeDays || 0, d.repairCount || 0, d.createdAt || "",
     ]);
     const registerSheet = XLSX.utils.aoa_to_sheet([registerHeaders, ...registerRows]);
     registerSheet["!cols"] = registerHeaders.map((h) => ({ wch: Math.max(h.length + 2, 14) }));
 
-    const historyHeaders = ["Drum ID", "Date", "Status", "Condition", "Party", "Days in Cycle", "Notes", "Logged By"];
+    const historyHeaders = ["Drum ID Number", "Date", "Status", "Condition", "Party", "Days in Cycle", "Notes", "Logged By"];
     const historySorted = [...history].sort((a, b) => (a.drumId === b.drumId ? a.ts - b.ts : a.drumId.localeCompare(b.drumId)));
     const historyRows = historySorted.map((h) => [
       h.drumId, h.date, STATUS_MAP[h.status] || h.status, CONDITIONS[h.condition]?.label || h.condition,
@@ -753,12 +769,13 @@ export default function DrumTracker() {
       startY: 54,
       margin: { left: marginX, right: marginX },
       head: [[
-        "Drum ID", "Style", "Status", "Condition", "Machine", "With Party",
+        "Drum ID Number", "Style", "Bore", "Status", "Condition", "Machine", "With Party",
         "Days in Status", "Life Days", "Repairs", "Added On",
       ]],
       body: drums.map((d) => [
         d.id,
         d.size,
+        d.bore || "—",
         STATUS_MAP[d.status] || "",
         CONDITIONS[d.condition]?.label || d.condition,
         d.machineNo || "—",
@@ -924,6 +941,38 @@ export default function DrumTracker() {
     showToast(`${drumId} deleted`);
   }
 
+  // Corrects a drum's own identity (ID Number / style / bore) after it's
+  // already been created. Renaming the ID cascades to every history entry
+  // and note that references it, since those are keyed by drumId.
+  async function editDrumIdentity(oldId, updates) {
+    const freshDrums = await fetchFresh("drums", drums);
+    const freshHistory = await fetchFresh("history", history);
+    const freshNotes = await fetchFresh("notes", notes);
+    const newId = updates.id;
+    const idChanged = newId !== oldId;
+    const nextDrums = freshDrums.map((d) =>
+      d.id === oldId ? { ...d, id: newId, size: updates.size, bore: updates.bore } : d
+    );
+    const nextHistory = idChanged
+      ? freshHistory.map((h) => (h.drumId === oldId ? { ...h, drumId: newId } : h))
+      : freshHistory;
+    const nextNotes = idChanged
+      ? freshNotes.map((n) => (n.drumId === oldId ? { ...n, drumId: newId } : n))
+      : freshNotes;
+    setDrums(nextDrums);
+    setHistory(nextHistory);
+    setNotes(nextNotes);
+    await persist(nextDrums, nextHistory);
+    if (idChanged) {
+      try {
+        await window.storage.set("notes", JSON.stringify(nextNotes), true);
+      } catch (e) {
+        // non-fatal
+      }
+    }
+    showToast(`${newId} updated`);
+  }
+
   async function deleteHistoryEntry(drumId, ts) {
     const freshDrums = await fetchFresh("drums", drums);
     const freshHistory = await fetchFresh("history", history);
@@ -957,7 +1006,7 @@ export default function DrumTracker() {
     showToast("Entry updated — totals recalculated");
   }
 
-  if (drums === null || roster === null || drumStyles === null) {
+  if (drums === null || roster === null || drumStyles === null || drumBores === null) {
     return (
       <div style={{ ...styles.app, alignItems: "center", justifyContent: "center", display: "flex" }}>
         <Loader2 className="spin" size={28} color="#8A9199" />
@@ -982,6 +1031,7 @@ export default function DrumTracker() {
         roster={roster}
         credentials={credentials}
         drumStyles={drumStyles}
+        drumBores={drumBores}
         onClose={() => setShowAdmin(false)}
         onAddEmployee={async (emp) => {
           const hash = await hashPassword(emp.password);
@@ -1000,6 +1050,8 @@ export default function DrumTracker() {
         }}
         onAddStyle={(style) => persistDrumStyles([...drumStyles, style])}
         onRemoveStyle={(style) => persistDrumStyles(drumStyles.filter((s) => s !== style))}
+        onAddBore={(bore) => persistDrumBores([...drumBores, bore])}
+        onRemoveBore={(bore) => persistDrumBores(drumBores.filter((b) => b !== bore))}
         parLevels={parLevels}
         onSetParLevel={(style, value) => persistParLevels({ ...parLevels, [style]: value })}
       />
@@ -1007,6 +1059,7 @@ export default function DrumTracker() {
   }
 
   const selected = selectedDrum ? drums.find((d) => d.id === selectedDrum) : null;
+  const editingDrumObj = editingDrumId ? drums.find((d) => d.id === editingDrumId) : null;
   const logTarget = showLog ? drums.find((d) => d.id === showLog) : null;
 
   return (
@@ -1259,6 +1312,15 @@ export default function DrumTracker() {
             }
             deleteDrum(selected.id);
           }}
+          onEditDrum={async () => {
+            const heldBy = await acquireLock(selected.id);
+            if (heldBy) {
+              showToast(`${heldBy} is currently editing this drum — try again shortly.`, true);
+              return;
+            }
+            setEditingDrumId(selected.id);
+            setSelectedDrum(null);
+          }}
           onEditEntry={async (h) => {
             const heldBy = await acquireLock(h.drumId);
             if (heldBy) {
@@ -1282,7 +1344,7 @@ export default function DrumTracker() {
         />
       )}
 
-      {showAdd && <AddDrumModal onClose={() => setShowAdd(false)} onSave={addDrum} existingIds={drums.map((d) => d.id)} drumStyles={drumStyles} allDrums={drums} />}
+      {showAdd && <AddDrumModal onClose={() => setShowAdd(false)} onSave={addDrum} existingIds={drums.map((d) => d.id)} drumStyles={drumStyles} drumBores={drumBores} allDrums={drums} />}
 
       {showChangePassword && (
         <ChangePasswordModal
@@ -1305,6 +1367,17 @@ export default function DrumTracker() {
           entry={editingEntry}
           onClose={() => { const id = editingEntry.drumId; setEditingEntry(null); releaseLock(id); }}
           onSave={async (updates) => { await editHistoryEntry(editingEntry.drumId, editingEntry.ts, updates); releaseLock(editingEntry.drumId); }}
+        />
+      )}
+
+      {editingDrumObj && (
+        <EditDrumModal
+          drum={editingDrumObj}
+          drumStyles={drumStyles}
+          drumBores={drumBores}
+          existingIds={drums.filter((d) => d.id !== editingDrumId).map((d) => d.id)}
+          onClose={() => { releaseLock(editingDrumId); setEditingDrumId(null); }}
+          onSave={async (updates) => { await editDrumIdentity(editingDrumId, updates); releaseLock(editingDrumId); setEditingDrumId(null); }}
         />
       )}
       </div>
@@ -1507,13 +1580,15 @@ function AuthGate({ roster, credentials, onLogin }) {
   );
 }
 
-function AdminPanel({ roster, credentials, drumStyles, onClose, onAddEmployee, onRemoveEmployee, onResetPassword, onAddStyle, onRemoveStyle, parLevels, onSetParLevel }) {
+function AdminPanel({ roster, credentials, drumStyles, drumBores, onClose, onAddEmployee, onRemoveEmployee, onResetPassword, onAddStyle, onRemoveStyle, onAddBore, onRemoveBore, parLevels, onSetParLevel }) {
   const [newId, setNewId] = useState("");
   const [newName, setNewName] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newStyle, setNewStyle] = useState("");
+  const [newBore, setNewBore] = useState("");
   const [error, setError] = useState("");
   const [styleError, setStyleError] = useState("");
+  const [boreError, setBoreError] = useState("");
   const [parDrafts, setParDrafts] = useState({});
   const [resetTargetId, setResetTargetId] = useState(null);
   const [resetDraft, setResetDraft] = useState("");
@@ -1558,6 +1633,16 @@ function AdminPanel({ roster, credentials, drumStyles, onClose, onAddEmployee, o
     }
     onAddStyle(newStyle.trim());
     setNewStyle("");
+  }
+
+  function addBore() {
+    setBoreError("");
+    if (!newBore.trim()) { setBoreError("Enter a drum bore size."); return; }
+    if (drumBores.some((b) => b.toLowerCase() === newBore.trim().toLowerCase())) {
+      setBoreError("That bore size already exists."); return;
+    }
+    onAddBore(newBore.trim());
+    setNewBore("");
   }
 
   return (
@@ -1641,6 +1726,23 @@ function AdminPanel({ roster, credentials, drumStyles, onClose, onAddEmployee, o
             <div key={s} style={styles.styleChip}>
               <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{s}</span>
               <button type="button" onClick={() => onRemoveStyle(s)} style={styles.styleChipRemove}><X size={12} /></button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ ...styles.adminCard, marginTop: 14 }}>
+        <div style={styles.historyHead}><PackagePlus size={14} /> Drum bores ({drumBores.length})</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 10 }}>
+          <Field label="New drum bore (e.g. 90mm)"><input style={styles.input} value={newBore} onChange={(e) => setNewBore(e.target.value)} /></Field>
+          <button type="button" onClick={addBore} style={{ ...styles.primaryBtn, height: 40 }}><Plus size={15} /> Add</button>
+        </div>
+        {boreError && <div style={{ ...styles.formError, marginBottom: 10 }}><AlertTriangle size={14} /> {boreError}</div>}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {drumBores.map((b) => (
+            <div key={b} style={styles.styleChip}>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{b}</span>
+              <button type="button" onClick={() => onRemoveBore(b)} style={styles.styleChipRemove}><X size={12} /></button>
             </div>
           ))}
         </div>
@@ -1958,12 +2060,12 @@ async function exportDrumHistoryCard(drum, historyForDrum) {
     headStyles: { fillColor: red, textColor: 255 },
     head: [["Field", "Value", "Field", "Value"]],
     body: [
-      ["Drum ID", drum.id, "Style / Spec", drum.size],
-      ["Status", STATUS_MAP[drum.status] || drum.status, "Condition", cond],
-      ["Registered On", drum.createdAt ? fmtDate(drum.createdAt) : "—", "Total Life in Service", `${drum.totalLifeDays || 0} day(s)`],
-      ["Times Repaired", String(drum.repairCount || 0), "Machine No.", drum.machineNo || "—"],
-      ["With Party", drum.party || "—", "PR / PO No.", [drum.prNumber, drum.poNumber].filter(Boolean).join(" / ") || "—"],
-      ["Scrap Reason", drum.scrapReason || "—", "", ""],
+      ["Drum ID Number", drum.id, "Style / Spec", drum.size],
+      ["Drum Bore", drum.bore || "—", "Condition", cond],
+      ["Status", STATUS_MAP[drum.status] || drum.status, "Total Life in Service", `${drum.totalLifeDays || 0} day(s)`],
+      ["Registered On", drum.createdAt ? fmtDate(drum.createdAt) : "—", "Machine No.", drum.machineNo || "—"],
+      ["Times Repaired", String(drum.repairCount || 0), "PR / PO No.", [drum.prNumber, drum.poNumber].filter(Boolean).join(" / ") || "—"],
+      ["With Party", drum.party || "—", "Scrap Reason", drum.scrapReason || "—"],
     ],
     columnStyles: {
       0: { fontStyle: "bold", textColor: ink, cellWidth: 105 },
@@ -2009,9 +2111,11 @@ async function exportDrumHistoryCard(drum, historyForDrum) {
   doc.save(`drum-history-card-${drum.id}.pdf`);
 }
 
-function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDeleteEntry, activeLock, currentUser, notes, onAddNote, onDeleteNote }) {
+function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditDrum, onEditEntry, onDeleteEntry, activeLock, currentUser, notes, onAddNote, onDeleteNote }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmingEditDrum, setConfirmingEditDrum] = useState(false);
   const [confirmingEntryTs, setConfirmingEntryTs] = useState(null);
+  const [confirmingEditEntryTs, setConfirmingEditEntryTs] = useState(null);
   const [confirmingNoteId, setConfirmingNoteId] = useState(null);
   const [noteDraft, setNoteDraft] = useState("");
   const c = CONDITIONS[drum.condition] || CONDITIONS.NEW;
@@ -2029,11 +2133,38 @@ function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDe
           <div className="dt-handle" style={styles.sheetHandle} />
           <div style={styles.panelHead}>
             <div>
-              <div style={styles.eyebrow}>DRUM ID</div>
+              <div style={styles.eyebrow}>DRUM ID NUMBER</div>
               <h2 style={styles.panelTitle}>{drum.id}</h2>
             </div>
-            <button style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                type="button"
+                style={styles.iconBtn}
+                onClick={() => setConfirmingEditDrum(true)}
+                disabled={lockedByOther}
+                title={lockedByOther ? `Locked by ${activeLock.by}` : "Edit drum details"}
+              >
+                <Pencil size={16} />
+              </button>
+              <button style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
+            </div>
           </div>
+
+          {confirmingEditDrum && (
+            <div style={styles.entryDeleteConfirm}>
+              <span>Edit this drum's ID, style, and bore?</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button type="button" style={styles.smallBtn} onClick={() => setConfirmingEditDrum(false)}>Cancel</button>
+                <button
+                  type="button"
+                  style={{ ...styles.smallBtn, color: "#fff", background: COLORS.amber, border: "none" }}
+                  onClick={() => { setConfirmingEditDrum(false); onEditDrum(); }}
+                >
+                  Confirm
+                </button>
+              </div>
+            </div>
+          )}
 
           {lockedByOther && (
             <div style={styles.lockBanner}>
@@ -2043,6 +2174,7 @@ function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDe
 
           <div style={styles.detailGrid}>
             <DetailStat label="Drum style" value={drum.size} />
+            {drum.bore && <DetailStat label="Drum bore" value={drum.bore} />}
             <DetailStat label="Status" value={STATUS_MAP[drum.status]} />
             <DetailStat label="Condition" value={<span style={{ ...styles.pill, color: c.fg, background: c.bg }}>{c.label}</span>} />
             {drum.machineNo && <DetailStat label="Machine" value={drum.machineNo} />}
@@ -2154,7 +2286,7 @@ function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDe
                   <div style={styles.timelineFooter}>
                     <div style={styles.timelineBy}><User size={11} /> {h.by}</div>
                     <div style={{ display: "flex", gap: 4 }}>
-                      <button type="button" style={styles.entryActionBtn} onClick={() => onEditEntry(h)} title="Edit this entry" disabled={lockedByOther}>
+                      <button type="button" style={styles.entryActionBtn} onClick={() => setConfirmingEditEntryTs(h.ts)} title="Edit this entry" disabled={lockedByOther}>
                         <Pencil size={12} />
                       </button>
                       <button type="button" style={styles.entryActionBtn} onClick={() => setConfirmingEntryTs(h.ts)} title="Delete this entry" disabled={lockedByOther}>
@@ -2162,6 +2294,21 @@ function DrumDetail({ drum, history, onClose, onLog, onDelete, onEditEntry, onDe
                       </button>
                     </div>
                   </div>
+                  {confirmingEditEntryTs === h.ts && (
+                    <div style={styles.entryDeleteConfirm}>
+                      <span>Edit this entry?</span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button type="button" style={styles.smallBtn} onClick={() => setConfirmingEditEntryTs(null)}>Cancel</button>
+                        <button
+                          type="button"
+                          style={{ ...styles.smallBtn, color: "#fff", background: COLORS.amber, border: "none" }}
+                          onClick={() => { onEditEntry(h); setConfirmingEditEntryTs(null); }}
+                        >
+                          Confirm
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   {confirmingEntryTs === h.ts && (
                     <div style={styles.entryDeleteConfirm}>
                       <span>Delete this entry?</span>
@@ -2322,11 +2469,12 @@ function ChangePasswordModal({ onClose, onSave }) {
   );
 }
 
-function AddDrumModal({ onClose, onSave, existingIds, drumStyles, allDrums }) {
-  const [id, setId] = useState(uid());
-  const [size, setSize] = useState(drumStyles[0] || "");
-  const [status, setStatus] = useState("STRS");
-  const [condition, setCondition] = useState("NEW");
+function AddDrumModal({ onClose, onSave, existingIds, drumStyles, drumBores, allDrums }) {
+  const [id, setId] = useState("");
+  const [size, setSize] = useState("");
+  const [bore, setBore] = useState("");
+  const [status, setStatus] = useState("");
+  const [condition, setCondition] = useState("");
   const [machineNo, setMachineNo] = useState("");
   const [party, setParty] = useState("");
   const [prNumber, setPrNumber] = useState("");
@@ -2348,17 +2496,18 @@ function AddDrumModal({ onClose, onSave, existingIds, drumStyles, allDrums }) {
   }
 
   function submit() {
-    if (!id.trim() || !size) {
-      setError("Drum ID and style are required.");
-      return;
-    }
-    if (existingIds.includes(id.trim())) {
-      setError("A drum with this ID already exists.");
-      return;
-    }
+    if (!id.trim()) { setError("Drum ID Number is required."); return; }
+    if (!/^\d{1,6}$/.test(id.trim())) { setError("Drum ID Number must be numeric, up to 6 digits."); return; }
+    if (existingIds.includes(id.trim())) { setError("A drum with this ID already exists."); return; }
+    if (!size) { setError("Drum style is required."); return; }
+    if (!bore) { setError("Drum bore is required."); return; }
+    if (!status) { setError("Status is required."); return; }
+    if (!condition) { setError("Condition is required."); return; }
+    if (status === "M/C" && !machineNo.trim()) { setError("Machine No. is required for a drum fixed on a machine."); return; }
     onSave({
       id: id.trim(),
       size,
+      bore,
       status,
       condition,
       machineNo: machineNo.trim(),
@@ -2379,8 +2528,16 @@ function AddDrumModal({ onClose, onSave, existingIds, drumStyles, allDrums }) {
         </div>
         <h2 style={{ ...styles.panelTitle, marginBottom: 16 }}><PackagePlus size={18} style={{ marginRight: 8, verticalAlign: -3 }} />Add a drum</h2>
         <div style={styles.form}>
-          <Field label="Drum ID">
-            <input style={styles.input} value={id} onChange={(e) => setId(e.target.value)} />
+          <Field label="Drum ID Number">
+            <input
+              style={styles.input}
+              value={id}
+              onChange={(e) => setId(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={6}
+              placeholder="Up to 6 digits"
+            />
           </Field>
           <Field label="Drum style">
             {drumStyles.length === 0 ? (
@@ -2389,6 +2546,15 @@ function AddDrumModal({ onClose, onSave, existingIds, drumStyles, allDrums }) {
               </div>
             ) : (
               <CustomSelect value={size} onChange={setSize} options={drumStyles.map((s) => ({ value: s, label: s }))} />
+            )}
+          </Field>
+          <Field label="Drum bore (mm)">
+            {drumBores.length === 0 ? (
+              <div style={{ fontSize: 12.5, color: COLORS.sub }}>
+                No drum bores set up yet — add some from the Admin panel first.
+              </div>
+            ) : (
+              <CustomSelect value={bore} onChange={setBore} options={drumBores.map((b) => ({ value: b, label: b }))} />
             )}
           </Field>
           <Field label="Status">
@@ -2406,7 +2572,7 @@ function AddDrumModal({ onClose, onSave, existingIds, drumStyles, allDrums }) {
             />
           </Field>
           {status === "M/C" && (
-            <Field label="Machine no. (if fixed on machine)">
+            <Field label="Machine no.">
               <input
                 style={styles.input}
                 value={machineNo}
@@ -2455,6 +2621,64 @@ function AddDrumModal({ onClose, onSave, existingIds, drumStyles, allDrums }) {
   );
 }
 
+// Corrects a drum's own identity — ID Number, style, bore — after it's
+// already been created. Separate from LogUpdateModal, which only ever
+// touches status/condition/etc, never the drum's own identity fields.
+function EditDrumModal({ drum, onClose, onSave, existingIds, drumStyles, drumBores }) {
+  const [id, setId] = useState(drum.id);
+  const [size, setSize] = useState(drum.size);
+  const [bore, setBore] = useState(drum.bore || "");
+  const [error, setError] = useState("");
+
+  function submit() {
+    if (!id.trim()) { setError("Drum ID Number is required."); return; }
+    if (!/^\d{1,6}$/.test(id.trim())) { setError("Drum ID Number must be numeric, up to 6 digits."); return; }
+    if (existingIds.includes(id.trim())) { setError("A drum with this ID already exists."); return; }
+    if (!size) { setError("Drum style is required."); return; }
+    if (!bore) { setError("Drum bore is required."); return; }
+    onSave({ id: id.trim(), size, bore });
+  }
+
+  return (
+    <div className="dt-overlay" style={styles.overlay} onClick={onClose}>
+      <div className="dt-sheet" style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <div className="dt-handle" style={styles.sheetHandle} />
+        <div style={styles.panelHead}>
+          <div style={styles.eyebrow}>EDIT DRUM</div>
+          <button type="button" style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
+        </div>
+        <h2 style={{ ...styles.panelTitle, marginBottom: 16 }}><Pencil size={18} style={{ marginRight: 8, verticalAlign: -3 }} />Edit drum details</h2>
+        <div style={styles.form}>
+          <div style={styles.formError}>
+            <AlertTriangle size={14} /> Changing the Drum ID Number updates its full history automatically.
+          </div>
+          <Field label="Drum ID Number">
+            <input
+              style={styles.input}
+              value={id}
+              onChange={(e) => setId(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={6}
+              placeholder="Up to 6 digits"
+            />
+          </Field>
+          <Field label="Drum style">
+            <CustomSelect value={size} onChange={setSize} options={drumStyles.map((s) => ({ value: s, label: s }))} />
+          </Field>
+          <Field label="Drum bore (mm)">
+            <CustomSelect value={bore} onChange={setBore} options={drumBores.map((b) => ({ value: b, label: b }))} />
+          </Field>
+          {error && <div style={styles.formError}><AlertTriangle size={14} /> {error}</div>}
+          <button type="button" onClick={submit} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginTop: 4 }}>
+            Save changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LogUpdateModal({ drum, allDrums, onClose, onSave }) {
   const [status, setStatus] = useState(drum.status);
   const [condition, setCondition] = useState(drum.condition);
@@ -2466,6 +2690,7 @@ function LogUpdateModal({ drum, allDrums, onClose, onSave }) {
   const [date, setDate] = useState(today());
   const [fixedDate, setFixedDate] = useState(today());
   const [notes, setNotes] = useState("");
+  const [error, setError] = useState("");
 
   const wasOnMachine = drum.status === "M/C";
   const goingOnMachine = status === "M/C";
@@ -2492,6 +2717,10 @@ function LogUpdateModal({ drum, allDrums, onClose, onSave }) {
   }
 
   function submit() {
+    if (goingOnMachine && !machineNo.trim()) {
+      setError("Machine No. is required for a drum fixed on a machine.");
+      return;
+    }
     onSave({ status, condition, machineNo, party, prNumber, poNumber, scrapReason, date, fixedDate, notes });
   }
 
@@ -2602,6 +2831,7 @@ function LogUpdateModal({ drum, allDrums, onClose, onSave }) {
           <Field label="Notes">
             <textarea style={{ ...styles.input, minHeight: 64, resize: "vertical" }} value={notes} onChange={(e) => setNotes(e.target.value)} />
           </Field>
+          {error && <div style={styles.formError}><AlertTriangle size={14} /> {error}</div>}
           <button type="button" onClick={submit} style={{ ...styles.primaryBtn, width: "100%", justifyContent: "center", marginTop: 4 }}>
             Save update
           </button>
